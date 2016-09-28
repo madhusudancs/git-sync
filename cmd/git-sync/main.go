@@ -20,10 +20,12 @@ package main // import "k8s.io/git-sync/cmd/git-sync"
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -67,7 +69,14 @@ var flPassword = flag.String("password", envString("GIT_SYNC_PASSWORD", ""),
 var flSSH = flag.Bool("ssh", envBool("GIT_SYNC_SSH", false),
 	"use SSH for git operations")
 
+var flNotify = flag.String("notify", "http://localhost:8080", "Webhook to notify of the changes")
+
 var log = newLoggerOrDie()
+
+type notification struct {
+	LocalRev  string `json:"localRev,omitempty"`
+	RemoteRev string `json:"remoteRev,omitempty"`
+}
 
 func newLoggerOrDie() logr.Logger {
 	g, err := glogr.New()
@@ -164,7 +173,7 @@ func main() {
 	initialSync := true
 	failCount := 0
 	for {
-		if err := syncRepo(*flRepo, *flBranch, *flRev, *flDepth, *flRoot, *flDest); err != nil {
+		if err := syncRepo(*flRepo, *flBranch, *flRev, *flDepth, *flRoot, *flDest, *flNotify); err != nil {
 			if initialSync || failCount >= *flMaxSyncFailures {
 				log.Errorf("error syncing repo: %v", err)
 				os.Exit(1)
@@ -347,11 +356,13 @@ func revIsHash(rev, gitRoot string) (bool, error) {
 }
 
 // syncRepo syncs the branch of a given repository to the destination at the given rev.
-func syncRepo(repo, branch, rev string, depth int, gitRoot, dest string) error {
+func syncRepo(repo, branch, rev string, depth int, gitRoot, dest, notify string) error {
 	target := path.Join(gitRoot, dest)
 	gitRepoPath := path.Join(target, ".git")
 	hash := rev
 	_, err := os.Stat(gitRepoPath)
+
+	var local, remote string
 	switch {
 	case os.IsNotExist(err):
 		err = cloneRepo(repo, branch, rev, depth, gitRoot)
@@ -380,7 +391,12 @@ func syncRepo(repo, branch, rev string, depth int, gitRoot, dest string) error {
 		}
 	}
 
-	return addWorktreeAndSwap(gitRoot, dest, branch, rev, hash)
+	err = addWorktreeAndSwap(gitRoot, dest, branch, rev, hash)
+	if err != nil {
+		return err
+	}
+
+	return notifySync(notify, local, remote)
 }
 
 // getRevs returns the local and upstream hashes for rev.
@@ -484,5 +500,27 @@ func setupGitSSH() error {
 		return fmt.Errorf("error running chmod on Secret (make sure Secret Volume is NOT mounted with readOnly=true): %v", err)
 	}
 
+	return nil
+}
+
+func notifySync(notify, local, remote string) error {
+	if len(notify) > 0 {
+		msg := notification{
+			LocalRev:  local,
+			RemoteRev: remote,
+		}
+		buf, err := json.Marshal(msg)
+		if err != nil {
+			return fmt.Errorf("failed to encode the notification message to JSON: %v", err)
+		}
+
+		resp, err := http.Post(notify, "application/json", bytes.NewReader(buf))
+		if err != nil {
+			return fmt.Errorf("failed to send the notification to %q: %v", notify, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("%q did not send a positive response: %v", notify, err)
+		}
+	}
 	return nil
 }

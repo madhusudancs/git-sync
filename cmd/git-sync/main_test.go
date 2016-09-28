@@ -17,6 +17,10 @@ limitations under the License.
 package main
 
 import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 )
@@ -96,5 +100,43 @@ func TestEnvInt(t *testing.T) {
 		if val != testCase.exp {
 			t.Fatalf("expected %v but %v returned", testCase.exp, val)
 		}
+	}
+}
+
+func TestNotifySync(t *testing.T) {
+	local := "a9d7e156339f7dae59a32044db4d4023b4caa978"
+	remote := "49112fc1876536980876d428a33a73d7a5af4156"
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "HTTP Method %q not supported", http.StatusBadRequest)
+			return
+		}
+
+		dec := json.NewDecoder(r.Body)
+		msg := &notification{}
+		err := dec.Decode(msg)
+		if err != nil {
+			http.Error(w, "Couldn't decode the request", http.StatusInternalServerError)
+			return
+		}
+
+		if msg.LocalRev != local {
+			http.Error(w, fmt.Sprintf("Unexpected local rev - got: %q, want: %q", msg.LocalRev, local), http.StatusBadRequest)
+			return
+		}
+		if msg.RemoteRev != remote {
+			http.Error(w, fmt.Sprintf("Unexpected remote rev - got: %q, want: %q", msg.RemoteRev, remote), http.StatusBadRequest)
+			return
+		}
+
+		fmt.Fprintln(w, "Success!")
+	}))
+	defer ts.Close()
+
+	err := notifySync(ts.URL, local, remote)
+	if err != nil {
+		t.Errorf("failed to notify: %v", err)
+		return
 	}
 }
